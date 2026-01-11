@@ -202,6 +202,24 @@ async def list_tools() -> list[Tool]:
                 "required": ["file_path"],
             },
         ),
+        Tool(
+            name="validate_model",
+            description="Validate ONNX model structure, check for errors, and assess runtime compatibility",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "file_path": {
+                        "type": "string",
+                        "description": "Path to the ONNX file",
+                    },
+                    "check_runtime": {
+                        "type": "boolean",
+                        "description": "Check ONNX Runtime compatibility (default: True)",
+                    },
+                },
+                "required": ["file_path"],
+            },
+        ),
     ]
 
 
@@ -230,6 +248,10 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
         elif name == "estimate_model_complexity":
             result = estimate_model_complexity(
                 arguments["file_path"], arguments.get("batch_size", 1)
+            )
+        elif name == "validate_model":
+            result = validate_model(
+                arguments["file_path"], arguments.get("check_runtime", True)
             )
         else:
             result = {"error": f"Unknown tool: {name}"}
@@ -614,6 +636,219 @@ def estimate_node_flops(
             return 4 * int(np.prod(output_shape)) * batch_size
 
     return 0
+
+
+def validate_model(file_path: str, check_runtime: bool = True) -> dict:
+    """Validate ONNX model and check for potential issues."""
+    result = {
+        "file_path": file_path,
+        "is_valid": False,
+        "checks": [],
+        "errors": [],
+        "warnings": [],
+    }
+
+    # 1. Basic file check
+    if not os.path.exists(file_path):
+        result["errors"].append(f"File not found: {file_path}")
+        return result
+
+    # 2. Load model
+    try:
+        model = onnx.load(file_path)
+        result["checks"].append({
+            "name": "model_load",
+            "status": "passed",
+            "message": "Model loaded successfully",
+        })
+    except Exception as e:
+        result["errors"].append(f"Failed to load model: {str(e)}")
+        result["checks"].append({
+            "name": "model_load",
+            "status": "failed",
+            "message": str(e),
+        })
+        return result
+
+    # 3. ONNX checker validation
+    try:
+        onnx.checker.check_model(model)
+        result["checks"].append({
+            "name": "onnx_checker",
+            "status": "passed",
+            "message": "Model passes ONNX checker validation",
+        })
+    except onnx.checker.ValidationError as e:
+        result["errors"].append(f"ONNX validation error: {str(e)}")
+        result["checks"].append({
+            "name": "onnx_checker",
+            "status": "failed",
+            "message": str(e),
+        })
+    except Exception as e:
+        result["warnings"].append(f"ONNX checker warning: {str(e)}")
+        result["checks"].append({
+            "name": "onnx_checker",
+            "status": "warning",
+            "message": str(e),
+        })
+
+    # 4. Shape inference check
+    try:
+        onnx.shape_inference.infer_shapes(model, strict_mode=True)
+        result["checks"].append({
+            "name": "shape_inference",
+            "status": "passed",
+            "message": "Shape inference successful",
+        })
+    except Exception as e:
+        result["warnings"].append(f"Shape inference issue: {str(e)}")
+        result["checks"].append({
+            "name": "shape_inference",
+            "status": "warning",
+            "message": str(e),
+        })
+
+    # 5. Opset version check
+    opset_version = None
+    for opset in model.opset_import:
+        if opset.domain == "" or opset.domain == "ai.onnx":
+            opset_version = opset.version
+            break
+
+    if opset_version:
+        if opset_version < 7:
+            result["warnings"].append(f"Old opset version ({opset_version}). Consider upgrading for better compatibility.")
+        result["checks"].append({
+            "name": "opset_version",
+            "status": "passed" if opset_version >= 7 else "warning",
+            "message": f"Opset version: {opset_version}",
+            "version": opset_version,
+        })
+
+    # 6. Operator support check
+    graph = model.graph
+    op_types = set()
+    for node in graph.node:
+        op_types.add((node.domain or "ai.onnx", node.op_type))
+
+    # Known commonly unsupported operators in some runtimes
+    potentially_unsupported = []
+    custom_ops = []
+    for domain, op_type in op_types:
+        if domain not in ("", "ai.onnx", "com.microsoft"):
+            custom_ops.append(f"{domain}:{op_type}")
+
+    if custom_ops:
+        result["warnings"].append(f"Custom operators found: {custom_ops}")
+        result["checks"].append({
+            "name": "custom_operators",
+            "status": "warning",
+            "message": f"Found {len(custom_ops)} custom operator(s)",
+            "operators": custom_ops,
+        })
+    else:
+        result["checks"].append({
+            "name": "custom_operators",
+            "status": "passed",
+            "message": "No custom operators found",
+        })
+
+    # 7. Check for empty or missing node names
+    unnamed_nodes = sum(1 for node in graph.node if not node.name)
+    if unnamed_nodes > 0:
+        result["warnings"].append(f"{unnamed_nodes} node(s) without names. This may cause issues in debugging.")
+        result["checks"].append({
+            "name": "node_names",
+            "status": "warning",
+            "message": f"{unnamed_nodes} unnamed nodes",
+            "unnamed_count": unnamed_nodes,
+        })
+    else:
+        result["checks"].append({
+            "name": "node_names",
+            "status": "passed",
+            "message": "All nodes have names",
+        })
+
+    # 8. Input/Output validation
+    inputs_without_shape = []
+    for inp in graph.input:
+        shape = get_tensor_shape(inp.type)
+        if not shape:
+            inputs_without_shape.append(inp.name)
+
+    if inputs_without_shape:
+        result["warnings"].append(f"Inputs without shape info: {inputs_without_shape}")
+        result["checks"].append({
+            "name": "input_shapes",
+            "status": "warning",
+            "message": f"{len(inputs_without_shape)} input(s) without shape",
+            "inputs": inputs_without_shape,
+        })
+    else:
+        result["checks"].append({
+            "name": "input_shapes",
+            "status": "passed",
+            "message": "All inputs have shape information",
+        })
+
+    # 9. ONNX Runtime compatibility check (optional)
+    if check_runtime:
+        try:
+            import onnxruntime as ort
+
+            # Try to create inference session
+            try:
+                sess_options = ort.SessionOptions()
+                sess_options.log_severity_level = 3  # Suppress warnings
+                session = ort.InferenceSession(file_path, sess_options, providers=['CPUExecutionProvider'])
+
+                result["checks"].append({
+                    "name": "onnxruntime_compatibility",
+                    "status": "passed",
+                    "message": "Model is compatible with ONNX Runtime",
+                    "onnxruntime_version": ort.__version__,
+                })
+
+                # Get supported providers
+                available_providers = ort.get_available_providers()
+                result["runtime_info"] = {
+                    "onnxruntime_version": ort.__version__,
+                    "available_providers": available_providers,
+                }
+
+            except Exception as e:
+                result["errors"].append(f"ONNX Runtime compatibility issue: {str(e)}")
+                result["checks"].append({
+                    "name": "onnxruntime_compatibility",
+                    "status": "failed",
+                    "message": str(e),
+                })
+
+        except ImportError:
+            result["checks"].append({
+                "name": "onnxruntime_compatibility",
+                "status": "skipped",
+                "message": "ONNX Runtime not installed. Install with: pip install onnxruntime",
+            })
+
+    # 10. Summary
+    passed_checks = sum(1 for c in result["checks"] if c["status"] == "passed")
+    failed_checks = sum(1 for c in result["checks"] if c["status"] == "failed")
+    warning_checks = sum(1 for c in result["checks"] if c["status"] == "warning")
+
+    result["summary"] = {
+        "total_checks": len(result["checks"]),
+        "passed": passed_checks,
+        "failed": failed_checks,
+        "warnings": warning_checks,
+    }
+
+    # Model is valid if no critical errors
+    result["is_valid"] = failed_checks == 0 and len(result["errors"]) == 0
+
+    return result
 
 
 def main():
