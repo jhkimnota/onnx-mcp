@@ -2,7 +2,7 @@
 
 ONNX 모델 구조와 메타데이터를 분석하는 MCP 서버입니다.
 
-## 설치
+## MCP 설치 가이드
 
 ### 1. 저장소 클론
 
@@ -15,7 +15,7 @@ cd onnx-mcp
 
 ```bash
 python -m venv venv
-source venv/bin/activate  # Windows: venv\Scripts\activate
+source venv/bin/activate  
 ```
 
 ### 3. 패키지 설치
@@ -28,9 +28,9 @@ pip install -e .
 
 ## MCP 클라이언트 설정
 
-### Claude Code
+### Claude Code (모든 세션에 적용)
 
-`~/.config/claude/claude_desktop_config.json` 파일을 열고 다음 내용을 추가합니다:
+`~/.config/claude-code/config.json` 파일을 열거나 생성하고 다음 내용을 추가합니다:
 
 ```json
 {
@@ -44,13 +44,26 @@ pip install -e .
 
 > `/path/to/onnx-mcp`는 실제 클론한 경로로 변경하세요.
 
+기존에 다른 MCP 서버가 설정되어 있다면 `mcpServers` 객체에 `onnx` 항목을 추가하면 됩니다:
+
+```json
+{
+  "mcpServers": {
+    "existing-server": {
+      "command": "..."
+    },
+    "onnx": {
+      "command": "/path/to/onnx-mcp/venv/bin/onnx-mcp-server"
+    }
+  }
+}
+```
+
+설정 후 새로운 Claude Code 세션을 시작하면 자동으로 ONNX MCP 서버가 로드됩니다.
+
 ### Cursor
 
-Cursor 설정에서 MCP 서버를 추가합니다. 설정 파일 위치는 OS에 따라 다릅니다:
-
-- macOS: `~/Library/Application Support/Cursor/User/globalStorage/saoudrizwan.claude-dev/settings/cline_mcp_settings.json`
-- Linux: `~/.config/Cursor/User/globalStorage/saoudrizwan.claude-dev/settings/cline_mcp_settings.json`
-- Windows: `%APPDATA%\Cursor\User\globalStorage\saoudrizwan.claude-dev\settings\cline_mcp_settings.json`
+Cursor 설정 파일에 다음 내용을 추가합니다 (`~/.config/Cursor/User/globalStorage/saoudrizwan.claude-dev/settings/cline_mcp_settings.json`):
 
 ```json
 {
@@ -62,7 +75,7 @@ Cursor 설정에서 MCP 서버를 추가합니다. 설정 파일 위치는 OS에
 }
 ```
 
-설정 후 Claude Code 또는 Cursor를 재시작하면 ONNX 관련 도구를 사용할 수 있습니다.
+설정 후 Cursor를 재시작하면 ONNX 도구를 사용할 수 있습니다.
 
 ## 제공 기능
 
