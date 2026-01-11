@@ -28,9 +28,12 @@ pip install -e .
 
 ## MCP 클라이언트 설정
 
-### Claude Code (모든 세션에 적용)
+### Claude Code
 
-`~/.config/claude-code/config.json` 파일을 열거나 생성하고 다음 내용을 추가합니다:
+다음 명령어를 사용하여 mcp를 등록합니다.
+```bash
+claude mcp add onnx-mcp -- "/path/to/onnx-mcp/venv/bin/onnx-mcp-server"
+```
 
 ```json
 {
@@ -61,21 +64,6 @@ pip install -e .
 
 설정 후 새로운 Claude Code 세션을 시작하면 자동으로 ONNX MCP 서버가 로드됩니다.
 
-### Cursor
-
-Cursor 설정 파일에 다음 내용을 추가합니다 (`~/.config/Cursor/User/globalStorage/saoudrizwan.claude-dev/settings/cline_mcp_settings.json`):
-
-```json
-{
-  "mcpServers": {
-    "onnx": {
-      "command": "/path/to/onnx-mcp/venv/bin/onnx-mcp-server"
-    }
-  }
-}
-```
-
-설정 후 Cursor를 재시작하면 ONNX 도구를 사용할 수 있습니다.
 
 ## 제공 기능
 
