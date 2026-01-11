@@ -220,6 +220,28 @@ async def list_tools() -> list[Tool]:
                 "required": ["file_path"],
             },
         ),
+        Tool(
+            name="compare_models",
+            description="Compare two ONNX models and analyze differences in structure, nodes, and weights",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "file_path_a": {
+                        "type": "string",
+                        "description": "Path to the first ONNX file (base model)",
+                    },
+                    "file_path_b": {
+                        "type": "string",
+                        "description": "Path to the second ONNX file (comparison model)",
+                    },
+                    "compare_weights": {
+                        "type": "boolean",
+                        "description": "Compare weight values and statistics (default: True)",
+                    },
+                },
+                "required": ["file_path_a", "file_path_b"],
+            },
+        ),
     ]
 
 
@@ -252,6 +274,12 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
         elif name == "validate_model":
             result = validate_model(
                 arguments["file_path"], arguments.get("check_runtime", True)
+            )
+        elif name == "compare_models":
+            result = compare_models(
+                arguments["file_path_a"],
+                arguments["file_path_b"],
+                arguments.get("compare_weights", True),
             )
         else:
             result = {"error": f"Unknown tool: {name}"}
@@ -847,6 +875,235 @@ def validate_model(file_path: str, check_runtime: bool = True) -> dict:
 
     # Model is valid if no critical errors
     result["is_valid"] = failed_checks == 0 and len(result["errors"]) == 0
+
+    return result
+
+
+def compare_models(file_path_a: str, file_path_b: str, compare_weights: bool = True) -> dict:
+    """Compare two ONNX models and analyze differences."""
+    result = {
+        "model_a": file_path_a,
+        "model_b": file_path_b,
+        "metadata_diff": {},
+        "structure_diff": {},
+        "node_diff": {},
+        "weight_diff": {},
+    }
+
+    # Load models
+    try:
+        model_a = load_model(file_path_a)
+        model_b = load_model(file_path_b)
+    except Exception as e:
+        return {"error": f"Failed to load models: {str(e)}"}
+
+    graph_a = model_a.graph
+    graph_b = model_b.graph
+
+    # 1. Metadata comparison
+    metadata_diff = {}
+
+    if model_a.ir_version != model_b.ir_version:
+        metadata_diff["ir_version"] = {"a": model_a.ir_version, "b": model_b.ir_version}
+
+    opset_a = {op.domain or "ai.onnx": op.version for op in model_a.opset_import}
+    opset_b = {op.domain or "ai.onnx": op.version for op in model_b.opset_import}
+    if opset_a != opset_b:
+        metadata_diff["opset"] = {"a": opset_a, "b": opset_b}
+
+    if model_a.producer_name != model_b.producer_name:
+        metadata_diff["producer_name"] = {"a": model_a.producer_name, "b": model_b.producer_name}
+
+    if graph_a.name != graph_b.name:
+        metadata_diff["graph_name"] = {"a": graph_a.name, "b": graph_b.name}
+
+    result["metadata_diff"] = metadata_diff if metadata_diff else {"status": "identical"}
+
+    # 2. Input/Output comparison
+    inputs_a = {inp.name: {"dtype": get_tensor_dtype(inp.type), "shape": get_tensor_shape(inp.type)} for inp in graph_a.input}
+    inputs_b = {inp.name: {"dtype": get_tensor_dtype(inp.type), "shape": get_tensor_shape(inp.type)} for inp in graph_b.input}
+
+    outputs_a = {out.name: {"dtype": get_tensor_dtype(out.type), "shape": get_tensor_shape(out.type)} for out in graph_a.output}
+    outputs_b = {out.name: {"dtype": get_tensor_dtype(out.type), "shape": get_tensor_shape(out.type)} for out in graph_b.output}
+
+    io_diff = {}
+
+    # Input differences
+    inputs_only_a = set(inputs_a.keys()) - set(inputs_b.keys())
+    inputs_only_b = set(inputs_b.keys()) - set(inputs_a.keys())
+    inputs_changed = []
+
+    for name in set(inputs_a.keys()) & set(inputs_b.keys()):
+        if inputs_a[name] != inputs_b[name]:
+            inputs_changed.append({
+                "name": name,
+                "a": inputs_a[name],
+                "b": inputs_b[name],
+            })
+
+    if inputs_only_a or inputs_only_b or inputs_changed:
+        io_diff["inputs"] = {
+            "only_in_a": list(inputs_only_a),
+            "only_in_b": list(inputs_only_b),
+            "changed": inputs_changed,
+        }
+
+    # Output differences
+    outputs_only_a = set(outputs_a.keys()) - set(outputs_b.keys())
+    outputs_only_b = set(outputs_b.keys()) - set(outputs_a.keys())
+    outputs_changed = []
+
+    for name in set(outputs_a.keys()) & set(outputs_b.keys()):
+        if outputs_a[name] != outputs_b[name]:
+            outputs_changed.append({
+                "name": name,
+                "a": outputs_a[name],
+                "b": outputs_b[name],
+            })
+
+    if outputs_only_a or outputs_only_b or outputs_changed:
+        io_diff["outputs"] = {
+            "only_in_a": list(outputs_only_a),
+            "only_in_b": list(outputs_only_b),
+            "changed": outputs_changed,
+        }
+
+    result["structure_diff"]["io"] = io_diff if io_diff else {"status": "identical"}
+
+    # 3. Node comparison
+    nodes_a = [(n.name or f"node_{i}", n.op_type, tuple(n.input), tuple(n.output)) for i, n in enumerate(graph_a.node)]
+    nodes_b = [(n.name or f"node_{i}", n.op_type, tuple(n.input), tuple(n.output)) for i, n in enumerate(graph_b.node)]
+
+    op_counts_a = Counter(n.op_type for n in graph_a.node)
+    op_counts_b = Counter(n.op_type for n in graph_b.node)
+
+    node_diff = {
+        "total_nodes": {"a": len(graph_a.node), "b": len(graph_b.node)},
+    }
+
+    # Op type differences
+    all_ops = set(op_counts_a.keys()) | set(op_counts_b.keys())
+    op_diff = {}
+    for op in all_ops:
+        count_a = op_counts_a.get(op, 0)
+        count_b = op_counts_b.get(op, 0)
+        if count_a != count_b:
+            op_diff[op] = {"a": count_a, "b": count_b, "diff": count_b - count_a}
+
+    node_diff["op_type_diff"] = op_diff if op_diff else {"status": "identical"}
+
+    # Find added/removed nodes by name
+    names_a = {n.name for n in graph_a.node if n.name}
+    names_b = {n.name for n in graph_b.node if n.name}
+
+    nodes_only_a = names_a - names_b
+    nodes_only_b = names_b - names_a
+
+    if nodes_only_a:
+        node_diff["removed_nodes"] = list(nodes_only_a)[:20]  # Limit to 20
+        if len(nodes_only_a) > 20:
+            node_diff["removed_nodes_total"] = len(nodes_only_a)
+
+    if nodes_only_b:
+        node_diff["added_nodes"] = list(nodes_only_b)[:20]  # Limit to 20
+        if len(nodes_only_b) > 20:
+            node_diff["added_nodes_total"] = len(nodes_only_b)
+
+    result["node_diff"] = node_diff
+
+    # 4. Weight comparison
+    if compare_weights:
+        init_a = {init.name: init for init in graph_a.initializer}
+        init_b = {init.name: init for init in graph_b.initializer}
+
+        weight_diff = {
+            "total_initializers": {"a": len(init_a), "b": len(init_b)},
+        }
+
+        weights_only_a = set(init_a.keys()) - set(init_b.keys())
+        weights_only_b = set(init_b.keys()) - set(init_a.keys())
+        common_weights = set(init_a.keys()) & set(init_b.keys())
+
+        if weights_only_a:
+            weight_diff["removed_weights"] = list(weights_only_a)[:10]
+            if len(weights_only_a) > 10:
+                weight_diff["removed_weights_total"] = len(weights_only_a)
+
+        if weights_only_b:
+            weight_diff["added_weights"] = list(weights_only_b)[:10]
+            if len(weights_only_b) > 10:
+                weight_diff["added_weights_total"] = len(weights_only_b)
+
+        # Compare common weights
+        changed_weights = []
+        total_param_diff = 0
+
+        for name in common_weights:
+            tensor_a = onnx.numpy_helper.to_array(init_a[name])
+            tensor_b = onnx.numpy_helper.to_array(init_b[name])
+
+            shape_changed = tensor_a.shape != tensor_b.shape
+            dtype_changed = tensor_a.dtype != tensor_b.dtype
+
+            if shape_changed or dtype_changed:
+                changed_weights.append({
+                    "name": name,
+                    "shape_a": list(tensor_a.shape),
+                    "shape_b": list(tensor_b.shape),
+                    "dtype_a": str(tensor_a.dtype),
+                    "dtype_b": str(tensor_b.dtype),
+                })
+                total_param_diff += int(np.prod(tensor_b.shape)) - int(np.prod(tensor_a.shape))
+            elif not np.array_equal(tensor_a, tensor_b):
+                # Same shape but different values
+                diff = tensor_b.astype(np.float64) - tensor_a.astype(np.float64)
+                changed_weights.append({
+                    "name": name,
+                    "shape": list(tensor_a.shape),
+                    "value_changed": True,
+                    "diff_stats": {
+                        "max_abs_diff": float(np.max(np.abs(diff))),
+                        "mean_abs_diff": float(np.mean(np.abs(diff))),
+                        "l2_norm_diff": float(np.linalg.norm(diff)),
+                    },
+                })
+
+        if changed_weights:
+            weight_diff["changed_weights"] = changed_weights[:15]  # Limit to 15
+            if len(changed_weights) > 15:
+                weight_diff["changed_weights_total"] = len(changed_weights)
+
+        weight_diff["unchanged_weights_count"] = len(common_weights) - len(changed_weights)
+
+        # Total parameter count comparison
+        params_a = sum(int(np.prod(onnx.numpy_helper.to_array(init_a[n]).shape)) for n in init_a)
+        params_b = sum(int(np.prod(onnx.numpy_helper.to_array(init_b[n]).shape)) for n in init_b)
+
+        weight_diff["total_parameters"] = {
+            "a": params_a,
+            "b": params_b,
+            "diff": params_b - params_a,
+        }
+
+        result["weight_diff"] = weight_diff
+    else:
+        result["weight_diff"] = {"status": "skipped"}
+
+    # 5. Summary
+    has_diff = (
+        result["metadata_diff"] != {"status": "identical"}
+        or result["structure_diff"].get("io") != {"status": "identical"}
+        or result["node_diff"]["total_nodes"]["a"] != result["node_diff"]["total_nodes"]["b"]
+        or (compare_weights and result["weight_diff"].get("changed_weights"))
+    )
+
+    result["summary"] = {
+        "models_identical": not has_diff,
+        "node_count_diff": result["node_diff"]["total_nodes"]["b"] - result["node_diff"]["total_nodes"]["a"],
+    }
+
+    if compare_weights:
+        result["summary"]["parameter_count_diff"] = result["weight_diff"]["total_parameters"]["diff"]
 
     return result
 
