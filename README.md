@@ -76,6 +76,7 @@ claude mcp add onnx-mcp -- "/path/to/onnx-mcp/venv/bin/onnx-mcp-server"
 - **estimate_model_complexity**: 메모리 사용량 및 FLOPs 추정
 - **validate_model**: 모델 구조 검증, 에러 체크, ONNX Runtime 호환성 확인
 - **compare_models**: 두 모델 비교 (구조, 노드, 가중치 차이 분석)
+- **get_quantization_info**: 양자화 정보 분석 (INT8/FP16, scale, zero_point, 양자화 연산자)
 
 ## 사용 예시
 
@@ -99,4 +100,8 @@ MCP가 연결된 Claude Code 또는 Cursor에서 자연어로 질문하면 자�
 이 두 모델의 차이점을 비교해줘
 
 fine-tuning 전후 모델의 가중치 변화량을 확인해줘
+
+이 모델 양자화 되어 있어?
+
+INT8 양자화된 레이어가 어떤 게 있어?
 ```
