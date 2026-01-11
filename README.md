@@ -74,6 +74,8 @@ claude mcp add onnx-mcp -- "/path/to/onnx-mcp/venv/bin/onnx-mcp-server"
 - **visualize_graph**: Mermaid 다이어그램으로 그래프 구조 시각화
 - **get_weight_statistics**: 가중치별 shape, 메모리 사용량, 값의 분포 통계
 - **estimate_model_complexity**: 메모리 사용량 및 FLOPs 추정
+- **validate_model**: 모델 구조 검증, 에러 체크, ONNX Runtime 호환성 확인
+- **compare_models**: 두 모델 비교 (구조, 노드, 가중치 차이 분석)
 
 ## 사용 예시
 
@@ -93,4 +95,8 @@ MCP가 연결된 Claude Code 또는 Cursor에서 자연어로 질문하면 자�
 그래프 구조를 다이어그램으로 보여줄 수 있어?
 
 모델의 opset 버전이 뭐야?
+
+이 두 모델의 차이점을 비교해줘
+
+fine-tuning 전후 모델의 가중치 변화량을 확인해줘
 ```
