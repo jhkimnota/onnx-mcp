@@ -242,6 +242,20 @@ async def list_tools() -> list[Tool]:
                 "required": ["file_path_a", "file_path_b"],
             },
         ),
+        Tool(
+            name="get_quantization_info",
+            description="Analyze quantization information of an ONNX model (INT8/FP16, scale, zero_point, quantized ops)",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "file_path": {
+                        "type": "string",
+                        "description": "Path to the ONNX file",
+                    },
+                },
+                "required": ["file_path"],
+            },
+        ),
     ]
 
 
@@ -281,6 +295,8 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
                 arguments["file_path_b"],
                 arguments.get("compare_weights", True),
             )
+        elif name == "get_quantization_info":
+            result = get_quantization_info(arguments["file_path"])
         else:
             result = {"error": f"Unknown tool: {name}"}
 
@@ -1104,6 +1120,185 @@ def compare_models(file_path_a: str, file_path_b: str, compare_weights: bool = T
 
     if compare_weights:
         result["summary"]["parameter_count_diff"] = result["weight_diff"]["total_parameters"]["diff"]
+
+    return result
+
+
+def get_quantization_info(file_path: str) -> dict:
+    """Analyze quantization information of an ONNX model."""
+    model = load_model(file_path)
+    graph = model.graph
+
+    # Quantization-related operators
+    QUANT_OPS = {
+        "QuantizeLinear",
+        "DequantizeLinear",
+        "QLinearConv",
+        "QLinearMatMul",
+        "QLinearAdd",
+        "QLinearMul",
+        "QLinearSigmoid",
+        "QLinearAveragePool",
+        "QLinearGlobalAveragePool",
+        "QLinearLeakyRelu",
+        "QLinearConcat",
+        "QAttention",
+        "DynamicQuantizeLinear",
+        "DynamicQuantizeMatMul",
+    }
+
+    # Low-precision data types
+    LOW_PRECISION_DTYPES = {"INT8", "UINT8", "FLOAT16", "BFLOAT16", "INT4", "UINT4"}
+
+    result = {
+        "file_path": file_path,
+        "is_quantized": False,
+        "quantization_type": None,
+        "quantized_ops": {},
+        "quantization_params": [],
+        "dtype_distribution": {},
+        "summary": {},
+    }
+
+    # 1. Analyze operators
+    op_counts = Counter(node.op_type for node in graph.node)
+    quant_op_counts = {op: count for op, count in op_counts.items() if op in QUANT_OPS}
+
+    if quant_op_counts:
+        result["is_quantized"] = True
+        result["quantized_ops"] = quant_op_counts
+
+    # 2. Determine quantization type
+    has_qlinear = any(op.startswith("QLinear") for op in quant_op_counts)
+    has_qdq = "QuantizeLinear" in quant_op_counts or "DequantizeLinear" in quant_op_counts
+    has_dynamic = any("Dynamic" in op for op in quant_op_counts)
+
+    if has_qlinear:
+        result["quantization_type"] = "QLinear (Integer-only)"
+    elif has_qdq:
+        result["quantization_type"] = "QDQ (Quantize-Dequantize)"
+    elif has_dynamic:
+        result["quantization_type"] = "Dynamic Quantization"
+
+    # 3. Analyze initializer data types
+    dtype_counts = Counter()
+    quantized_weights = []
+
+    for init in graph.initializer:
+        dtype_name = ONNX_DTYPE_MAP.get(init.data_type, "UNKNOWN")
+        dtype_counts[dtype_name] += 1
+
+        if dtype_name in LOW_PRECISION_DTYPES:
+            tensor = onnx.numpy_helper.to_array(init)
+            weight_info = {
+                "name": init.name,
+                "dtype": dtype_name,
+                "shape": list(tensor.shape),
+                "param_count": int(np.prod(tensor.shape)),
+            }
+
+            # Check if it's a scale or zero_point parameter
+            name_lower = init.name.lower()
+            if "scale" in name_lower:
+                weight_info["role"] = "scale"
+                if tensor.size <= 10:
+                    weight_info["values"] = tensor.flatten().tolist()
+            elif "zero_point" in name_lower or "zp" in name_lower:
+                weight_info["role"] = "zero_point"
+                if tensor.size <= 10:
+                    weight_info["values"] = tensor.flatten().tolist()
+            else:
+                weight_info["role"] = "quantized_weight"
+
+            quantized_weights.append(weight_info)
+
+    result["dtype_distribution"] = dict(dtype_counts)
+
+    # 4. Extract quantization parameters from QuantizeLinear/DequantizeLinear nodes
+    quant_params = []
+    init_map = {init.name: init for init in graph.initializer}
+
+    for node in graph.node:
+        if node.op_type in ("QuantizeLinear", "DequantizeLinear"):
+            param_info = {
+                "node_name": node.name or f"unnamed_{node.op_type}",
+                "op_type": node.op_type,
+                "input": node.input[0] if node.input else None,
+                "output": node.output[0] if node.output else None,
+            }
+
+            # Get scale (input[1])
+            if len(node.input) > 1 and node.input[1] in init_map:
+                scale_tensor = onnx.numpy_helper.to_array(init_map[node.input[1]])
+                param_info["scale"] = {
+                    "name": node.input[1],
+                    "shape": list(scale_tensor.shape),
+                    "values": scale_tensor.flatten().tolist()[:10],  # Limit to first 10
+                }
+
+            # Get zero_point (input[2])
+            if len(node.input) > 2 and node.input[2] in init_map:
+                zp_tensor = onnx.numpy_helper.to_array(init_map[node.input[2]])
+                param_info["zero_point"] = {
+                    "name": node.input[2],
+                    "dtype": ONNX_DTYPE_MAP.get(init_map[node.input[2]].data_type, "UNKNOWN"),
+                    "shape": list(zp_tensor.shape),
+                    "values": zp_tensor.flatten().tolist()[:10],  # Limit to first 10
+                }
+
+            quant_params.append(param_info)
+
+    if quant_params:
+        result["quantization_params"] = quant_params[:20]  # Limit to 20
+        if len(quant_params) > 20:
+            result["quantization_params_total"] = len(quant_params)
+
+    # 5. Check for FP16 model
+    fp16_weights = sum(1 for w in quantized_weights if w["dtype"] == "FLOAT16")
+    int8_weights = sum(1 for w in quantized_weights if w["dtype"] in ("INT8", "UINT8"))
+
+    if fp16_weights > 0 and not result["is_quantized"]:
+        result["is_quantized"] = True
+        result["quantization_type"] = "FP16 (Half Precision)"
+
+    # 6. Analyze input/output precision
+    io_precision = {"inputs": [], "outputs": []}
+
+    for inp in graph.input:
+        dtype = get_tensor_dtype(inp.type)
+        io_precision["inputs"].append({"name": inp.name, "dtype": dtype})
+
+    for out in graph.output:
+        dtype = get_tensor_dtype(out.type)
+        io_precision["outputs"].append({"name": out.name, "dtype": dtype})
+
+    result["io_precision"] = io_precision
+
+    # 7. Summary
+    total_weights = len(graph.initializer)
+    quantized_weight_count = len([w for w in quantized_weights if w.get("role") == "quantized_weight"])
+
+    result["summary"] = {
+        "is_quantized": result["is_quantized"],
+        "quantization_type": result["quantization_type"],
+        "total_weights": total_weights,
+        "quantized_weights": quantized_weight_count,
+        "quantized_ops_count": sum(quant_op_counts.values()),
+        "fp16_tensors": fp16_weights,
+        "int8_tensors": int8_weights,
+    }
+
+    # Calculate memory savings estimate
+    if result["is_quantized"]:
+        fp32_params = sum(1 for d in dtype_counts if d == "FLOAT") * dtype_counts.get("FLOAT", 0)
+        int8_params = sum(dtype_counts.get(d, 0) for d in ("INT8", "UINT8"))
+        fp16_params = dtype_counts.get("FLOAT16", 0) + dtype_counts.get("BFLOAT16", 0)
+
+        if int8_params > 0 or fp16_params > 0:
+            result["summary"]["estimated_compression"] = {
+                "int8_ratio": round(int8_params / max(total_weights, 1), 2),
+                "fp16_ratio": round(fp16_params / max(total_weights, 1), 2),
+            }
 
     return result
 
